@@ -18,7 +18,7 @@ Intel RealSense D-series (x3: front, right, left)
           |  /full_body_data       (BodyMsg)
           |  /left_rula_score, /right_rula_score  (Int16)
           v
- [pcb_ergonomic_assistant]  Gradient-descent Z-height optimiser
+ [pcb_ergonomic_assistant]  Gradient-descent Z-height optimiser & Logging
           |  RTDE  -->  UR5e robot
           |  /gui_notifications    (String)
           v
@@ -42,7 +42,8 @@ The system runs a three-phase state machine:
 - **Gradient-descent optimizer** — EMA-smoothed cost function drives the robot Z-axis to the ergonomic optimum; transitions to manual control when stable or after a 60-second timeout
 - **Gesture control** — Thumbs Up / Thumbs Down detected via dual-hand voting buffer with leading-edge latch; adjusts PCB height 15 mm per tap in `USER_ADJUSTMENT`
 - **Real-time GUI** — Live camera feeds, colour-coded RULA score bars, phase indicator, system log, and a matplotlib trend diagram of arm scores over time
-- **Audio feedback** — Procedurally generated chime plays when optimisation converges
+- **Experiment Logging & Data Analysis** — Integrated `experiment_logger` records the optimization trajectory and RULA scores to CSV, facilitating post-experiment analysis.
+- **Validation & Simulation Framework** — Extensive offline tools under `scripts/validate/` for validating RULA scoring, running Monte Carlo simulations of the optimizer, evaluating sensor jitter, and generating publication-ready figures and LaTeX tables.
 
 ---
 
@@ -104,7 +105,7 @@ Model download: [Google Drive — AlphaPose pretrained models](https://github.co
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install opencv-python numpy customtkinter matplotlib pillow
 pip install ur-rtde         # UR5e RTDE control
-pip install tqdm
+pip install tqdm pandas     # Additional analysis dependencies
 ```
 
 ### 5. cv_bridge (ROS 2)
@@ -155,8 +156,16 @@ To change AlphaPose model paths, edit [src/point_2D_extractor/point_2D_extractor
 
 ## Usage
 
-### Option A — Full stack (single command)
+### Option A — Full stack (Staggered Launch)
+This is the recommended way to start the system, sequentially loading camera nodes to avoid initialization spikes:
+```bash
+ros2 launch rula_gui staggered_rula_launch.py \
+    front_id:=<front-camera-serial> \
+    right_id:=<right-camera-serial> \
+    left_id:=<left-camera-serial>
+```
 
+### Option B — Full stack (Standard Launch)
 ```bash
 ros2 launch rula_gui ergonomic_stack.launch.py \
     front_id:=<front-camera-serial> \
@@ -164,12 +173,7 @@ ros2 launch rula_gui ergonomic_stack.launch.py \
     left_id:=<left-camera-serial>
 ```
 
-Find camera serial numbers with:
-```bash
-rs-enumerate-devices | grep Serial
-```
-
-### Option B — Launch nodes individually
+### Option C — Launch nodes individually
 
 **Terminal 1 — Pose extraction (all 3 cameras)**
 ```bash
@@ -261,15 +265,21 @@ src/
 │   ├── rula_calculator/
 │   │   ├── rula_calculator.py            # 3D RULA computation node
 │   │   ├── pcb_ergonomic_assistant.py    # Gradient-descent Z-height optimiser
+│   │   ├── experiment_logger.py          # Data recording utility
 │   │   └── proactive_rtde_controller.py  # Proportional RTDE controller (alternative)
-│   └── config/
-│       └── ergonomic_assistant.yaml
+│   ├── config/
+│   │   └── ergonomic_assistant.yaml
+│   └── scripts/validate/                 # Validation & Simulation tools
+│       ├── simulate_optimizer.py         # Monte Carlo validation tests
+│       ├── validate_rula_scoring.py
+│       └── generate_paper_figures.py
 └── rula_gui/                     # Dashboard GUI
     ├── rula_gui/
     │   └── rulaGui.py            # customtkinter + matplotlib dashboard
     └── launch/
         ├── rula_run.launch.py
-        └── ergonomic_stack.launch.py     # Full-stack launcher
+        ├── ergonomic_stack.launch.py     # Full-stack launcher
+        └── staggered_rula_launch.py      # Staggered camera initialisation
 ```
 
 ---
@@ -294,6 +304,7 @@ Key geometry notes:
 - `points2angle(A, B, C)` returns the angle at vertex B (interior angle of triangle ABC)
 - Neck/trunk upright posture yields ~180° from the raw angle function (anti-parallel vectors); the code applies `180° − raw` to convert to forward-flexion degrees
 - Abduction is detected both angularly (>40° shoulder-to-hip angle) and metrically (wrist >25 cm from spine centreline)
+- For in-depth mathematical calculations refer to [math_description.md](src/rula_calculator/rula_calculator/math_description.md).
 
 ---
 
@@ -313,7 +324,7 @@ Convergence criteria (first to fire wins):
 2. **Plateau detection** — sum of `|z_offset|` over last 15 cycles < 8 mm total
 3. **Hard timeout** — 60 seconds elapsed since entering `RULA_OPTIMIZING`
 
-EMA smoothing (`alpha = 0.25`) reduces sensor noise before computing the gradient.
+EMA smoothing (`alpha = 0.25`) reduces sensor noise before computing the gradient. Detailed analysis and offline simulations of this process can be found in the `src/rula_calculator/scripts/validate/` tools.
 
 ---
 
