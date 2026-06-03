@@ -1,7 +1,5 @@
 # ROS 2 RULA Ergonomic Monitor
 
-![System GUI](docs/images/gui_screenshot.png)
-
 A real-time ergonomic monitoring and robot-assisted workstation adjustment stack for ROS 2 (Jazzy). The system uses [AlphaPose](https://github.com/MVIG-SJTU/AlphaPose) with Intel RealSense depth cameras to estimate 3D skeletal pose, computes RULA (Rapid Upper Limb Assessment) scores, and drives a UR5e collaborative robot to continuously optimise the PCB workpiece height for the operator.
 
 ---
@@ -196,6 +194,8 @@ ros2 run rula_calculator pcb_ergonomic_assistant \
 ros2 run rula_gui rulaGui
 ```
 
+![System GUI](docs/images/gui_screenshot.png)
+
 ### Gesture control (USER_ADJUSTMENT phase only)
 
 | Gesture | Action |
@@ -328,15 +328,6 @@ Convergence criteria (first to fire wins):
 3. **Hard timeout** — 60 seconds elapsed since entering `RULA_OPTIMIZING`
 
 EMA smoothing (`alpha = 0.25`) reduces sensor noise before computing the gradient. Detailed analysis and offline simulations of this process can be found in the `src/rula_calculator/scripts/validate/` tools.
-
----
-
-## Known Limitations
-
-- AlphaPose hand-keypoint confidence scores for Halpe 136 commonly fall in the 0.10–0.30 range; the gesture confidence threshold is set to 0.10 accordingly
-- Depth holes in the RealSense image are patched with a 5×5 median filter; occluded joints fall back to (0, 0, 0) in 3D
-- The RTDE controller requires a direct Ethernet connection to the UR5e (not WiFi)
-- The GUI is sized for a 2560×1600 display; scale the `ctk.CTk` window geometry for smaller screens
 
 ---
 
