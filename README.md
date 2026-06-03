@@ -6,7 +6,7 @@ A real-time ergonomic monitoring and robot-assisted workstation adjustment stack
 
 ## Overview
 
-![Software Architecture](docs/images/SA.png)
+![Software Architecture](docs/images/ergonomic_architecture.png)
 
 ```
 Intel RealSense D-series (x3: front, right, left)
