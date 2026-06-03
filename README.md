@@ -43,7 +43,6 @@ The system runs a three-phase state machine:
 - **Gesture control** — Thumbs Up / Thumbs Down detected via dual-hand voting buffer with leading-edge latch; adjusts PCB height 15 mm per tap in `USER_ADJUSTMENT`
 - **Real-time GUI** — Live camera feeds, colour-coded RULA score bars, phase indicator, system log, and a matplotlib trend diagram of arm scores over time
 - **Experiment Logging & Data Analysis** — Integrated `experiment_logger` records the optimization trajectory and RULA scores to CSV, facilitating post-experiment analysis.
-- **Validation & Simulation Framework** — Extensive offline tools under `scripts/validate/` for validating RULA scoring, running Monte Carlo simulations of the optimizer, evaluating sensor jitter, and generating publication-ready figures and LaTeX tables.
 
 ---
 
