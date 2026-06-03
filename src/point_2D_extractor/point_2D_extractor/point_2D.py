@@ -193,9 +193,9 @@ class process_3D(Node):
         # Queues to hold depth map and intrinsics synchronized with frames
         depth_info_queues = {} 
         for side in args.active_sides:
-            writer[side] = DataWriter_rs(cfg, args, save_video=False, queueSize=2)
+            writer[side] = DataWriter_rs(cfg, args, save_video=False, queueSize=16)
             writer[side].start()
-            depth_info_queues[side] = queue.Queue(maxsize=10)
+            depth_info_queues[side] = queue.Queue(maxsize=2)
 
         batchSize = args.posebatch if not args.flip else int(args.posebatch / 2)
 
@@ -230,14 +230,28 @@ class process_3D(Node):
                             hm = pose_model(inps)
                             hm = hm.cpu()
                             
-                            # Push current depth profile to sync queue
-                            depth_info_queues[side].put((depth_img, intrinsics))
+                            # Push current depth profile to sync queue — drop oldest
+                            # if full so the inference loop never blocks here.
+                            try:
+                                depth_info_queues[side].put_nowait((depth_img, intrinsics))
+                            except queue.Full:
+                                try: depth_info_queues[side].get_nowait()
+                                except queue.Empty: pass
+                                depth_info_queues[side].put_nowait((depth_img, intrinsics))
                             writer[side].save(boxes, scores, ids, hm, cropped_boxes, orig_img, im_name)
 
-                        # Check if inference is ready
-                        if writer[side].count_results() > 0:
+                        # Check if inference is ready — drain ALL pending results,
+                        # keeping only the latest, so key_points never backs up
+                        # and blocks the DataWriter worker thread.
+                        latest_kp = None
+                        while writer[side].count_results() > 0:
                             try:
-                                keypoints, vis_frame = writer[side].key_points.get_nowait()
+                                latest_kp = writer[side].key_points.get_nowait()
+                            except queue.Empty:
+                                break
+                        if latest_kp is not None:
+                            try:
+                                keypoints, vis_frame = latest_kp
                                 synced_depth, synced_intrinsics = depth_info_queues[side].get_nowait()
                                 
                                 # Safely handle tensor shapes

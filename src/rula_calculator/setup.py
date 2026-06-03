@@ -25,6 +25,7 @@ setup(
             'proactive_rtde = rula_calculator.proactive_rtde_controller:main',
             'pcb_ergonomic_assistant = rula_calculator.pcb_ergonomic_assistant:main',
             'gesture = rula_calculator.gesture:main',
+            'experiment_logger = rula_calculator.experiment_logger:main',
         ],
     },
 )

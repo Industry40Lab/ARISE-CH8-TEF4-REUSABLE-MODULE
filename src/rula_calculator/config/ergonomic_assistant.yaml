@@ -14,3 +14,5 @@ pcb_ergonomic_assistant:
 
     # ── Timing ──────────────────────────────────────────────────────────────
     movement_cooldown_sec: 1.5       # minimum seconds between consecutive optimizer moves
+    optimizer_timeout_sec: 60.0      # maximum seconds to run automatic optimization before manual control
+

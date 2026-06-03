@@ -1,3 +1,4 @@
+import math
 import rclpy
 from rclpy.node import Node
 import time
@@ -74,18 +75,32 @@ class OptimizationRTDEController(Node):
         self.data_timeout   = 1.5        # seconds before data is considered stale
 
         # ── EMA smoothing ────────────────────────────────────────
-        self.ema_alpha       = 0.25   # heavier smoothing reduces sensor-noise gradient spikes
-        self._smoothed_upper = None
-        self._smoothed_lower = None
+        self.ema_alpha           = 0.10   # strong smoothing reduces EMA lag near optimum
+        self._smoothed_upper     = None
+        self._smoothed_lower     = None
+        # Jacobian EMA — slower alpha suppresses sign-flip oscillation from keypoint noise
+        self.jac_ema_alpha       = 0.15
+        self._smoothed_jac_upper = None
+        self._smoothed_jac_lower = None
 
         # ── RULA ergonomic targets ───────────────────────────────
-        self.ideal_upper    = 20.0
+        # Optimal angles: centres of RULA score-1 zones (Chaffin et al. 2006)
+        self.ideal_upper    = 10.0   # degrees — midpoint of [0°, 20°] bench-work neutral
+        self.ideal_lower    = 80.0   # degrees — midpoint of [60°, 100°] safe elbow zone
+        self.weight_upper   = 4.0
+        self.weight_lower   = 2.0
+        # Asymmetric pseudo-Huber shape parameters (Huber 1964; Peternel et al. 2019)
+        # σ_above < σ_below → steeper cost when arm rises above optimal (biomechanical
+        # asymmetry: deltoid moment arm decreases above ~30°, Hagberg 1981)
+        self.upper_sigma_below = 20.0   # gentle slope below 10° (passive tissue support)
+        self.upper_sigma_above = 12.0   # steep slope above 10° (active muscle load)
+        self.upper_phub_scale  =  1.0
+        self.lower_sigma_below = 18.0   # symmetric: RULA boundary at 60° = 80° − 20°
+        self.lower_sigma_above = 18.0   # symmetric: RULA boundary at 100° = 80° + 20°
+        self.lower_phub_scale  =  0.5
+        # Keep for stability/exit criterion only (not cost):
         self.safe_lower_min = 60.0
         self.safe_lower_max = 100.0
-        self.weight_upper   = 4.0
-        self.weight_lower   = 1.0
-        self.dUpper_dZ      = 1.0
-        self.dLower_dZ      = -1.0
         self.learning_rate  = 0.0005
         # Stability threshold is evaluated on the *unclamped* gradient offset so
         # that clamping to max_step does not mask a genuine ergonomic need.
@@ -96,10 +111,6 @@ class OptimizationRTDEController(Node):
         # 12 cycles × 100 ms = 1.2 s minimum fill time; 70 % → 9/12 stable
         self._stability_window    = collections.deque(maxlen=12)
         self.required_stable_frac = 0.70
-
-        # ── Convergence timeout ──────────────────────────────────
-        self.optimizer_timeout_sec = 60.0
-        self._rula_start_time      = None   # set when entering RULA_OPTIMIZING
 
         # ── Plateau detection ─────────────────────────────────────
         # Last 15 cycles' |z_offset| summed; if total Z movement < 8 mm
@@ -122,10 +133,14 @@ class OptimizationRTDEController(Node):
         self._reconnect_attempts = 0
         self.max_reconnects      = 5
 
+        # ── Cached TCP Z (polled in background, never on spin thread) ─────────
+        self._cached_tcp_z = float('nan')
+
         # ── Async movement thread ────────────────────────────────
         self._move_event     = Event()
         self._shutdown_event = Event()
-        self._move_thread    = Thread(target=self._movement_worker, daemon=True)
+        self._move_thread       = Thread(target=self._movement_worker, daemon=True)
+        self._rtde_poll_thread  = Thread(target=self._rtde_pose_loop,  daemon=True)
 
         # ── Connect to robot ─────────────────────────────────────
         self.get_logger().info(f"Connecting to UR5e at {self.robot_ip}…")
@@ -143,6 +158,7 @@ class OptimizationRTDEController(Node):
             raise
 
         self._move_thread.start()
+        self._rtde_poll_thread.start()
 
         # ── ROS interfaces ───────────────────────────────────────
         self.create_subscription(BodyMsg, '/full_body_data',   self._cb_rula,    10)
@@ -168,9 +184,10 @@ class OptimizationRTDEController(Node):
                 # Fresh start: clear all optimizer state.
                 self._stability_window.clear()
                 self._plateau_window.clear()
-                self._smoothed_upper  = None
-                self._smoothed_lower  = None
-                self._rula_start_time = time.time()
+                self._smoothed_upper     = None
+                self._smoothed_lower     = None
+                self._smoothed_jac_upper = None
+                self._smoothed_jac_lower = None
 
         tag = f"[{old_phase.name} → {new_phase.name}]"
         msg = f"{tag}  {reason}" if reason else tag
@@ -231,8 +248,14 @@ class OptimizationRTDEController(Node):
     def _handle_rtde_failure(self):
         self._reconnect_attempts += 1
         if self._reconnect_attempts > self.max_reconnects:
-            self.get_logger().fatal("Max RTDE reconnect attempts reached. Shutting down.")
-            rclpy.shutdown()
+            # Do NOT shut down — reset the counter and keep the node alive.
+            # The background TCP poller (_rtde_pose_loop) will recover the
+            # read channel automatically; the control channel reconnect is
+            # retried on the next triggered move.
+            self.get_logger().error(
+                "Max RTDE reconnect attempts reached. Optimizer paused; "
+                "will retry automatically when the robot connection recovers.")
+            self._reconnect_attempts = 0
             return
 
         backoff = min(2.0 ** self._reconnect_attempts, 30.0)
@@ -250,6 +273,25 @@ class OptimizationRTDEController(Node):
             self.get_logger().info("RTDE reconnected.")
         except Exception as e:
             self.get_logger().error(f"Reconnect failed: {e}")
+
+    # =========================================================================
+    # BACKGROUND TCP POSE POLLER  (never blocks the ROS spin thread)
+    # =========================================================================
+
+    def _rtde_pose_loop(self):
+        """Poll TCP Z at 20 Hz in the background; cache under lock."""
+        while not self._shutdown_event.is_set():
+            try:
+                pose = self.rtde_r.getActualTCPPose()
+                with self._lock:
+                    self._cached_tcp_z = float(pose[2])
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    def _get_tcp_z(self) -> float:
+        with self._lock:
+            return self._cached_tcp_z
 
     # =========================================================================
     # ROS CALLBACKS
@@ -342,18 +384,18 @@ class OptimizationRTDEController(Node):
         if not self._rula_is_active():
             return
 
-        if is_moving or (now - last_action < self.cooldown):
-            return
-
-        # ── Convergence timeout ───────────────────────────────────
+        # ── Hard timeout check ───────────────────────────────────
         with self._lock:
-            rula_start = self._rula_start_time
-
-        if rula_start is not None and (now - rula_start) >= self.optimizer_timeout_sec:
+            opt_start = self._optimization_start_time
+        
+        if now - opt_start > self.timeout:
             self._transition_to(
                 Phase.USER_ADJUSTMENT,
-                f"Optimization timeout ({self.optimizer_timeout_sec:.0f} s) — "
-                "switching to operator control.")
+                f"Optimizer timeout ({int(self.timeout)}s) reached. "
+                "Switching to operator control.")
+            return
+
+        if is_moving or (now - last_action < self.cooldown):
             return
 
         # ── Plateau detection ─────────────────────────────────────
@@ -381,6 +423,18 @@ class OptimizationRTDEController(Node):
             return angle - self.safe_lower_max
         return 0.0
 
+    def _asymmetric_pseudo_huber(self, angle: float, optimal: float,
+                                  sigma_below: float, sigma_above: float,
+                                  scale: float) -> float:
+        """
+        Returns ∂C/∂θ of the asymmetric pseudo-Huber cost.
+        Quadratic near optimal, linear tails — gradient never vanishes at large deviations.
+        sigma_above < sigma_below → steeper penalty when angle exceeds optimal.
+        """
+        d     = angle - optimal
+        sigma = sigma_above if d >= 0.0 else sigma_below
+        return scale * d / (sigma ** 2 * math.sqrt(1.0 + (d / sigma) ** 2))
+
     def _optimize_posture(self, msg: BodyMsg):
         # Both sides required — control loop already guarantees this via presence
         # check, but guard here as a safety net.
@@ -389,7 +443,6 @@ class OptimizationRTDEController(Node):
 
         # Worst-case upper arm angle (most raised side).
         raw_upper = max(msg.right_arm_up, msg.left_arm_up)
-
         # Elbow angle that deviates most from the safe range.
         raw_lower = sorted(
             [msg.right_low_angle, msg.left_low_angle],
@@ -407,23 +460,58 @@ class OptimizationRTDEController(Node):
                                         + (1 - self.ema_alpha) * self._smoothed_lower)
             su, sl = self._smoothed_upper, self._smoothed_lower
 
-        # Gradient of ergonomic cost w.r.t. robot Z.
-        dC_dU = (2 * self.weight_upper * (su - self.ideal_upper)
-                 if su > self.ideal_upper else 0.0)
-
-        if sl < self.safe_lower_min:
-            dC_dL = -2 * self.weight_lower * (self.safe_lower_min - sl)
-        elif sl > self.safe_lower_max:
-            dC_dL = 2 * self.weight_lower * (sl - self.safe_lower_max)
+        # Determine which side drives the optimization and its Jacobian.
+        # du_dz is picked from the arm with the most flexion (most raised).
+        if msg.right_arm_up > msg.left_arm_up:
+            du_dz = msg.d_right_upper_dz
         else:
-            dC_dL = 0.0
+            du_dz = msg.d_left_upper_dz
 
-        # Compute raw (unclamped) gradient step — used for stability detection.
-        z_offset_raw = -self.learning_rate * (dC_dU * self.dUpper_dZ + dC_dL * self.dLower_dZ)
+        # dl_dz is picked from the arm that deviates most from the safe elbow range.
+        if self._lower_deviation(msg.right_low_angle) > self._lower_deviation(msg.left_low_angle):
+            dl_dz = msg.d_right_lower_dz
+        else:
+            dl_dz = msg.d_left_lower_dz
+
+        # Drop frames where keypoint detection produced invalid Jacobians
+        # (can occur during occlusion or AlphaPose confidence drops).
+        if not (math.isfinite(du_dz) and math.isfinite(dl_dz)):
+            return
+
+        # Apply EMA to Jacobians — suppresses keypoint-noise sign flips that reverse gradient.
+        with self._lock:
+            if self._smoothed_jac_upper is None:
+                self._smoothed_jac_upper = du_dz
+                self._smoothed_jac_lower = dl_dz
+            else:
+                self._smoothed_jac_upper = (self.jac_ema_alpha * du_dz
+                                            + (1 - self.jac_ema_alpha) * self._smoothed_jac_upper)
+                self._smoothed_jac_lower = (self.jac_ema_alpha * dl_dz
+                                            + (1 - self.jac_ema_alpha) * self._smoothed_jac_lower)
+            du_dz = self._smoothed_jac_upper
+            dl_dz = self._smoothed_jac_lower
+
+        # Gradient of ergonomic cost w.r.t. angles — asymmetric pseudo-Huber.
+        # Nonzero everywhere: no dead zones, no one-sided dropouts.
+        dC_dU = self._asymmetric_pseudo_huber(
+            su, self.ideal_upper,
+            self.upper_sigma_below, self.upper_sigma_above,
+            self.upper_phub_scale) * self.weight_upper
+
+        dC_dL = self._asymmetric_pseudo_huber(
+            sl, self.ideal_lower,
+            self.lower_sigma_below, self.lower_sigma_above,
+            self.lower_phub_scale) * self.weight_lower
+
+        # Compute raw (unclamped) gradient step using the dynamic Jacobian.
+        # Chain rule: dC/dZ = (dC/dU * dU/dZ) + (dC/dL * dL/dZ)
+        z_offset_raw = -self.learning_rate * (dC_dU * du_dz + dC_dL * dl_dz)
 
         # ── Sliding-window stability check (on unclamped gradient) ───────────
-        # This prevents max_step clamping from hiding a genuine ergonomic need.
-        stable_this_cycle = abs(z_offset_raw) < self.min_move_thr
+        # raw_in_zone: raw angles already green regardless of EMA lag or Jacobian noise.
+        raw_in_zone       = (raw_upper <= self.ideal_upper
+                             and self._lower_deviation(raw_lower) == 0.0)
+        stable_this_cycle = raw_in_zone or (abs(z_offset_raw) < self.min_move_thr)
 
         with self._lock:
             self._stability_window.append(stable_this_cycle)
@@ -447,9 +535,11 @@ class OptimizationRTDEController(Node):
         # ── Apply gradient step — clamped to max_step (3 mm) ─────────────────
         z_offset = max(min(z_offset_raw, self.max_step), -self.max_step)
 
-        current_pose  = self.rtde_r.getActualTCPPose()
-        target_z      = max(min(current_pose[2] + z_offset, self.z_max), self.z_min)
-        actual_offset = target_z - current_pose[2]
+        current_z = self._get_tcp_z()
+        if math.isnan(current_z):
+            return
+        target_z      = max(min(current_z + z_offset, self.z_max), self.z_min)
+        actual_offset = target_z - current_z
 
         if abs(actual_offset) < 0.001:   # sub-millimetre — skip
             return
@@ -470,10 +560,13 @@ class OptimizationRTDEController(Node):
     # =========================================================================
 
     def _apply_gesture(self, offset: float, direction: str):
-        current  = self.rtde_r.getActualTCPPose()
-        target_z = max(min(current[2] + offset, self.z_max), self.z_min)
+        current_z = self._get_tcp_z()
+        if math.isnan(current_z):
+            self._notify("TCP pose not yet available — please wait.")
+            return
+        target_z = max(min(current_z + offset, self.z_max), self.z_min)
 
-        if abs(target_z - current[2]) < 0.005:
+        if abs(target_z - current_z) < 0.005:
             self._notify(f"Limit reached — cannot move {direction} any further.")
             return
 

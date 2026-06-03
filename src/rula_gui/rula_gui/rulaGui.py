@@ -148,6 +148,21 @@ class rula_gui(Node):
         self._q_alert   = queue.Queue(maxsize=30)
         self._q_gesture = queue.Queue(maxsize=10)
 
+        # Raw image queues — ROS callbacks drop raw msgs here with no PIL work.
+        # Per-camera worker threads pull from these and do imgmsg_to_cv2 + resize
+        # on their own thread, keeping the ROS spin thread free for RULA callbacks.
+        self._q_raw_front = queue.Queue(maxsize=2)
+        self._q_raw_right = queue.Queue(maxsize=2)
+        self._q_raw_left  = queue.Queue(maxsize=2)
+        for raw_q, disp_q in [
+            (self._q_raw_front, self._q_front),
+            (self._q_raw_right, self._q_right),
+            (self._q_raw_left,  self._q_left),
+        ]:
+            threading.Thread(
+                target=self._img_worker, args=(raw_q, disp_q), daemon=True
+            ).start()
+
         self._phase = "INIT"
         self._last_alert_time   = 0.0
         self._last_gesture      = "NONE"
@@ -185,18 +200,36 @@ class rula_gui(Node):
 
     # ─── ROS callbacks ───────────────────────────────────────────────────────
 
-    def _push_frame(self, msg, q: queue.Queue):
-        frame = self._br.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+    def _push_frame(self, msg, raw_q: queue.Queue):
+        # Drop the raw ROS message into the per-camera raw queue.
+        # imgmsg_to_cv2 + PIL resize are done by the worker thread so
+        # the ROS spin thread is never blocked by image decoding.
         try:
-            q.put_nowait(frame)
+            raw_q.put_nowait(msg)
         except queue.Full:
-            try: q.get_nowait()
+            try: raw_q.get_nowait()
             except queue.Empty: pass
-            q.put_nowait(frame)
+            raw_q.put_nowait(msg)
 
-    def _cb_front(self, msg): self._push_frame(msg, self._q_front)
-    def _cb_right(self, msg): self._push_frame(msg, self._q_right)
-    def _cb_left(self,  msg): self._push_frame(msg, self._q_left)
+    def _img_worker(self, raw_q: queue.Queue, display_q: queue.Queue):
+        """Decode and resize camera frames off the ROS spin thread."""
+        while True:
+            try:
+                msg   = raw_q.get()
+                frame = self._br.imgmsg_to_cv2(msg, desired_encoding='rgb8')
+                pil   = Image.fromarray(frame).resize((420, 560), Image.BILINEAR)
+                try:
+                    display_q.put_nowait(pil)
+                except queue.Full:
+                    try: display_q.get_nowait()
+                    except queue.Empty: pass
+                    display_q.put_nowait(pil)
+            except Exception:
+                pass
+
+    def _cb_front(self, msg): self._push_frame(msg, self._q_raw_front)
+    def _cb_right(self, msg): self._push_frame(msg, self._q_raw_right)
+    def _cb_left(self,  msg): self._push_frame(msg, self._q_raw_left)
 
     def _cb_rula(self, msg):
         try:
@@ -384,8 +417,8 @@ class rula_gui(Node):
             ("upper_arm_l", "Upper Arm L", 1, 0),
             ("upper_arm_r", "Upper Arm R", 1, 2),
             ("neck",        "Neck",        1, 4),
-            ("lower_arm_l", "Lower Arm L", 1, 6),
-            ("lower_arm_r", "Lower Arm R", 1, 8),
+            ("lower_arm_l", "Elbow Flex. L", 1, 6),
+            ("lower_arm_r", "Elbow Flex. R", 1, 8),
             ("trunk",       "Trunk",       1, 10),
         ]
         for key, lbl, r, c in angle_defs:
@@ -605,21 +638,29 @@ class rula_gui(Node):
     # ─── Poll loop (≈30 fps) ─────────────────────────────────────────────────
 
     def _poll(self):
-        # Camera feeds
-        for q, img_wgt, status_wgt in zip(
-            [self._q_left, self._q_front, self._q_right],
-            self._cam_img,
-            self._cam_status,
-        ):
-            try:
-                frame = q.get_nowait()
-                pil   = Image.fromarray(frame).resize((420, 560))
-                photo = ImageTk.PhotoImage(pil)
-                img_wgt.configure(image=photo)
-                img_wgt.image = photo
-                status_wgt.configure(text="● LIVE", text_color="#00c853")
-            except queue.Empty:
-                pass
+        # Camera feeds — capped at 15 fps to reduce PhotoImage GC pressure.
+        # PIL resize is done in the ROS callback thread; only the cheap
+        # ImageTk.PhotoImage wrap happens here on the main thread.
+        now = time.time()
+        cam_ready = not hasattr(self, '_cam_last_t') or (now - self._cam_last_t) >= 0.067
+        if cam_ready:
+            updated = False
+            for q, img_wgt, status_wgt in zip(
+                [self._q_left, self._q_front, self._q_right],
+                self._cam_img,
+                self._cam_status,
+            ):
+                try:
+                    pil   = q.get_nowait()
+                    photo = ImageTk.PhotoImage(pil)
+                    img_wgt.configure(image=photo)
+                    img_wgt.image = photo
+                    status_wgt.configure(text="● LIVE", text_color="#00c853")
+                    updated = True
+                except queue.Empty:
+                    pass
+            if updated:
+                self._cam_last_t = now
 
         # RULA scores
         try:
@@ -741,7 +782,12 @@ class rula_gui(Node):
             self._diag_la_l  = self._diag_la_l[-600:]
             self._diag_la_r  = self._diag_la_r[-600:]
 
-        self._draw_avatar()
+        # Only redraw avatar when scores actually change — avoids CTkImage
+        # allocation on every BodyMsg tick when posture is stable.
+        new_snapshot = tuple(self._part_score[k] for k in sorted(self._part_score))
+        if not hasattr(self, '_avatar_score_snapshot') or new_snapshot != self._avatar_score_snapshot:
+            self._avatar_score_snapshot = new_snapshot
+            self._draw_avatar()
 
     def _voice_alert(self):
         if time.time() - self._last_alert_time < 30:

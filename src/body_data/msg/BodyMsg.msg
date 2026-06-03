@@ -23,3 +23,9 @@ int16 neck_score
 int16 trunk_score
 bool right
 bool left
+
+# Sensitivity of angles to Z-height (Jacobian)
+float32 d_right_upper_dz
+float32 d_right_lower_dz
+float32 d_left_upper_dz
+float32 d_left_lower_dz

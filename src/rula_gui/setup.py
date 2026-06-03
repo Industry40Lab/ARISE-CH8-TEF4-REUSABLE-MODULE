@@ -15,6 +15,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/rula_run.launch.py',
             'launch/ergonomic_stack.launch.py',
+            'launch/staggered_rula_launch.py'
         ]),
     ],
     install_requires=['setuptools'],
